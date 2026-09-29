@@ -57,6 +57,48 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_habit_sessions_active
         ON habit_sessions(ended_at)
         WHERE ended_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS daily_metrics (
+          day TEXT PRIMARY KEY,
+          workout INTEGER,
+          daily_note TEXT,
+          steps INTEGER,
+          streamed INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         """
     )
+    daily_metric_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(daily_metrics)")
+    }
+    if "daily_note" not in daily_metric_columns:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN daily_note TEXT")
+    if "workout_note" in daily_metric_columns:
+        conn.execute(
+            """
+            UPDATE daily_metrics
+            SET daily_note = workout_note
+            WHERE daily_note IS NULL AND workout_note IS NOT NULL
+            """
+        )
+        conn.executescript(
+            """
+            CREATE TABLE daily_metrics_new (
+              day TEXT PRIMARY KEY,
+              workout INTEGER,
+              daily_note TEXT,
+              steps INTEGER,
+              streamed INTEGER,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT INTO daily_metrics_new
+              (day, workout, daily_note, steps, streamed, created_at, updated_at)
+            SELECT day, workout, daily_note, steps, streamed, created_at, updated_at
+            FROM daily_metrics;
+            DROP TABLE daily_metrics;
+            ALTER TABLE daily_metrics_new RENAME TO daily_metrics;
+            """
+        )
     conn.commit()

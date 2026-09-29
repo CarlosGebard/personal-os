@@ -25,3 +25,12 @@ class HabitSession:
     source: str
     note: str | None
     metadata_json: str | None
+
+
+@dataclass(frozen=True)
+class DailyMetric:
+    day: str
+    workout: bool | None
+    daily_note: str | None
+    steps: int | None
+    streamed: bool | None

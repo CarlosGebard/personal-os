@@ -68,14 +68,33 @@ def date_range_bounds_utc(days: list[date]) -> tuple[datetime, datetime]:
     return start, end
 
 
-def ensure_habit(conn: sqlite3.Connection, name: str, category: str = "focus") -> str:
+def normalize_habit_name(name: str) -> str:
     normalized = name.strip()
     if not normalized:
         raise ValueError("Habit name cannot be empty")
+    return normalized
 
+
+def get_habit_id(conn: sqlite3.Connection, name: str) -> str | None:
+    normalized = normalize_habit_name(name)
+    row = conn.execute("SELECT id FROM habits WHERE name = ?", (normalized,)).fetchone()
+    if not row:
+        return None
+    return str(row["id"])
+
+
+def require_habit_id(conn: sqlite3.Connection, name: str) -> str:
+    habit_id = get_habit_id(conn, name)
+    if not habit_id:
+        raise ValueError(f"Unknown habit: {name}. Create it first with `habit create {name}`")
+    return habit_id
+
+
+def create_habit(conn: sqlite3.Connection, name: str, category: str = "focus") -> str:
+    normalized = normalize_habit_name(name)
     row = conn.execute("SELECT id FROM habits WHERE name = ?", (normalized,)).fetchone()
     if row:
-        return str(row["id"])
+        raise ValueError(f"Habit already exists: {normalized}")
 
     habit_id = str(uuid.uuid4())
     ts = now_iso()
@@ -88,6 +107,103 @@ def ensure_habit(conn: sqlite3.Connection, name: str, category: str = "focus") -
     )
     conn.commit()
     return habit_id
+
+
+def delete_habit(conn: sqlite3.Connection, name: str) -> int:
+    habit_id = require_habit_id(conn, name)
+    deleted_sessions = conn.execute(
+        "SELECT COUNT(*) AS count FROM habit_sessions WHERE habit_id = ?",
+        (habit_id,),
+    ).fetchone()
+    conn.execute("DELETE FROM habit_sessions WHERE habit_id = ?", (habit_id,))
+    conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
+    conn.commit()
+    return int(deleted_sessions["count"])
+
+
+def bool_to_db(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+def ensure_daily_metric(conn: sqlite3.Connection, day: date) -> None:
+    day_key = day.isoformat()
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT INTO daily_metrics (day, created_at, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(day) DO NOTHING
+        """,
+        (day_key, ts, ts),
+    )
+
+
+def set_workout_metric(
+    conn: sqlite3.Connection,
+    day: date,
+    done: bool,
+    note: str | None = None,
+) -> None:
+    ensure_daily_metric(conn, day)
+    conn.execute(
+        """
+        UPDATE daily_metrics
+        SET workout = ?, daily_note = COALESCE(?, daily_note), updated_at = ?
+        WHERE day = ?
+        """,
+        (bool_to_db(done), note, now_iso(), day.isoformat()),
+    )
+    conn.commit()
+
+
+def set_steps_metric(conn: sqlite3.Connection, day: date, steps: int) -> None:
+    if steps < 0:
+        raise ValueError("Steps must be 0 or greater")
+    ensure_daily_metric(conn, day)
+    conn.execute(
+        """
+        UPDATE daily_metrics
+        SET steps = ?, updated_at = ?
+        WHERE day = ?
+        """,
+        (steps, now_iso(), day.isoformat()),
+    )
+    conn.commit()
+
+
+def set_stream_metric(conn: sqlite3.Connection, day: date, streamed: bool) -> None:
+    ensure_daily_metric(conn, day)
+    conn.execute(
+        """
+        UPDATE daily_metrics
+        SET streamed = ?, updated_at = ?
+        WHERE day = ?
+        """,
+        (bool_to_db(streamed), now_iso(), day.isoformat()),
+    )
+    conn.commit()
+
+
+def daily_metrics_between(
+    conn: sqlite3.Connection,
+    start_day: date,
+    end_day: date,
+) -> dict[date, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT day, workout, daily_note, steps, streamed
+        FROM daily_metrics
+        WHERE day >= ? AND day <= ?
+        ORDER BY day ASC
+        """,
+        (start_day.isoformat(), end_day.isoformat()),
+    ).fetchall()
+    return {
+        date.fromisoformat(str(row["day"])): row
+        for row in rows
+    }
 
 
 def get_active_session(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -128,11 +244,20 @@ def stop_habit(conn: sqlite3.Connection, habit_name: str) -> sqlite3.Row | None:
     return stop_active(conn)
 
 
-def start_habit(conn: sqlite3.Connection, name: str, category: str = "focus") -> str:
-    habit_id = ensure_habit(conn, name, category)
+def start_habit(conn: sqlite3.Connection, name: str, stop_existing: bool = False) -> str:
+    habit_id = require_habit_id(conn, name)
+    active = get_active_session(conn)
+    if active and active["habit_name"] == name:
+        raise ValueError(f"Habit already running: {name}")
+    if active and not stop_existing:
+        active_name = str(active["habit_name"])
+        raise ValueError(
+            f"Habit already running: {active_name}. Stop it first or use `habit switch {name}`"
+        )
 
     # Strict mode: only one active session globally.
-    stop_active(conn)
+    if active:
+        stop_active(conn)
 
     session_id = str(uuid.uuid4())
     ts = now_iso()
@@ -161,7 +286,7 @@ def add_manual_session(
     if hours > 24:
         raise ValueError("Hours must be 24 or less")
 
-    habit_id = ensure_habit(conn, name, category)
+    habit_id = require_habit_id(conn, name)
     started_at = datetime.combine(day, time.min).astimezone()
     ended_at = started_at + timedelta(hours=hours)
     session_id = str(uuid.uuid4())
